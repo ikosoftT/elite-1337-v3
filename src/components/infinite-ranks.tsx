@@ -1,0 +1,68 @@
+'use client';
+
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { RankRow, type RankRowData } from '@/components/rank-row';
+import { ChevronUp } from '@/components/icons';
+
+/** Leaderboard rows that keep loading while you scroll, one 25-row page at a time. */
+export function InfiniteRanks({ initial, query, pages, endpoint = '/api/leaderboard/rows' }: { initial: RankRowData[]; query: string; pages: number; endpoint?: string }) {
+  const [rows, setRows] = useState(initial);
+  const [next, setNext] = useState(2);
+  const [state, setState] = useState<'idle' | 'loading' | 'error'>('idle');
+  const end = useRef<HTMLDivElement>(null);
+  const list = useRef<HTMLOListElement>(null);
+  const busy = useRef(false);
+  const done = next > pages;
+  const [far, setFar] = useState(false);
+  const [middle, setMiddle] = useState<number | null>(null);
+
+  // "Back to top" appears once the list has carried the student well down the page.
+  useEffect(() => {
+    const update = () => setFar(window.scrollY > 320);
+    update();
+    window.addEventListener('scroll', update, { passive: true });
+    return () => window.removeEventListener('scroll', update);
+  }, []);
+  // Centred on the list column, not the window, so on wide screens it sits clear of the avatars and names.
+  useEffect(() => {
+    const measure = () => { const box = list.current?.getBoundingClientRect(); setMiddle(box ? Math.round(box.left + box.width / 2) : null); };
+    measure();
+    window.addEventListener('resize', measure);
+    return () => window.removeEventListener('resize', measure);
+  }, []);
+  const toTop = () => window.scrollTo({ top: 0, behavior: matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth' });
+
+  const load = useCallback(async () => {
+    if (busy.current || next > pages) return;
+    busy.current = true;
+    setState('loading');
+    try {
+      // A request that never answers shows "Try again" after 20 s instead of loading forever.
+      const response = await fetch(`${endpoint}?${query}${query ? '&' : ''}page=${next}`, { cache: 'no-store', signal: AbortSignal.timeout(20_000) });
+      if (!response.ok) throw new Error(String(response.status));
+      const body = await response.json() as { rows: RankRowData[] };
+      setRows((current) => { const seen = new Set(current.map((row) => row.id)); return [...current, ...body.rows.filter((row) => !seen.has(row.id))]; });
+      setNext((page) => page + 1);
+      setState('idle');
+    } catch { setState('error'); }
+    finally { busy.current = false; }
+  }, [endpoint, next, pages, query]);
+
+  useEffect(() => {
+    const target = end.current;
+    if (!target || done || state === 'error') return;
+    const observer = new IntersectionObserver((entries) => { if (entries.some((entry) => entry.isIntersecting)) void load(); }, { rootMargin: '600px 0px' });
+    observer.observe(target);
+    return () => observer.disconnect();
+  }, [done, load, state]);
+
+  return <>
+    <ol ref={list} className="pl-rows">{rows.map((row) => <li key={row.id} className="pl-item"><RankRow row={row}/></li>)}</ol>
+    <div ref={end} className="pl-more" aria-live="polite">
+      {state === 'loading' && <span className="pl-more-dots" aria-label="Loading more students"><i/><i/><i/></span>}
+      {state === 'error' && <button type="button" className="pl-more-retry" onClick={() => { setState('idle'); void load(); }}>Could not load more. Try again</button>}
+      {done && pages > 1 && <span className="pl-more-end">You reached the end</span>}
+    </div>
+    <button type="button" className="pl-top" style={middle === null ? undefined : { left: middle }} data-on={far || undefined} onClick={toTop} tabIndex={far ? 0 : -1} aria-hidden={!far}><ChevronUp size={18}/>Back to top</button>
+  </>;
+}

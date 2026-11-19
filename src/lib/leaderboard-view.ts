@@ -1,0 +1,96 @@
+import { z } from 'zod';
+import { cohortSchema } from './cohorts';
+import { campusName, type BlackholedStudent, type RankingDataset } from './dataset';
+import { mergeByLevel, selectLeaderboard, type StudentRank } from './ranking';
+import { loadLastSeen } from './last-seen';
+import { matchesSearch } from './search';
+import { photoReferences } from './avatars/intra-photo';
+import { genderSchema } from './gender-roster';
+import type { RankRowData } from '@/components/rank-row';
+
+/** Shared by the leaderboard page and its rows endpoint, so both read the same filters and pages. */
+export const ALL = 'all';
+export const filtersSchema = z.object({
+  campus: z.coerce.number().int().positive().optional(),
+  cohort: cohortSchema.optional(),
+  q: z.string().trim().max(40).optional(),
+  bh: z.enum(['all', 'blackholed', 'alumni', 'frozen']).optional(),
+  gender: genderSchema.optional(),
+  page: z.coerce.number().int().min(1).max(10000).default(1),
+  order: z.enum(['desc']).optional(),
+});
+export type Filters = z.infer<typeof filtersSchema>;
+export type Ranked = StudentRank & { rank: number };
+type Raw = Record<string, string | string[] | undefined>;
+type Profile = { campus_users: { campus_id: number; is_primary?: boolean | null }[] } | null;
+const noGenderIds = new Set<number>();
+
+export const leaderboardHref = (filters: Partial<Filters>) => {
+  const params = new URLSearchParams();
+  for (const key of ['campus', 'cohort', 'q', 'bh'] as const) params.set(key, filters[key] ? String(filters[key]) : '');
+  if (filters.gender) params.set('gender', filters.gender);
+  if (filters.order) params.set('order', filters.order);
+  if (filters.page && filters.page > 1) params.set('page', String(filters.page));
+  return `/leaderboard?${params}`;
+};
+
+/** Missing campus/cohort mean "my own"; "all" (or empty) means no filter. */
+export function resolveFilters(raw: Raw, dataset: RankingDataset, profile: Profile, userId: string) {
+  const param = (key: string) => { const value = raw[key]; return value === ALL ? '' : value; };
+  const own = dataset.students.find((student) => String(student.id) === userId);
+  const validCampusIds = new Set(dataset.campuses.map((campus) => campus.id));
+  const defaultCampus = profile?.campus_users.find((entry) => entry.is_primary && validCampusIds.has(entry.campus_id))?.campus_id ?? own?.campusIds[0];
+  const defaultCohort = own?.commonCoreCohort ?? undefined;
+  const parsed = filtersSchema.safeParse({
+    campus: param('campus') === undefined ? defaultCampus : param('campus') || undefined,
+    cohort: param('cohort') === undefined ? defaultCohort : param('cohort') || undefined,
+    q: raw.q || undefined, bh: raw.bh || undefined, gender: genderSchema.safeParse(raw.gender).data, page: raw.page || 1, order: raw.order || undefined,
+  });
+  const filters: Filters = parsed.success ? parsed.data : { campus: defaultCampus, cohort: defaultCohort, page: 1 };
+  if (filters.campus && !validCampusIds.has(filters.campus)) filters.campus = undefined;
+  return { filters, own, defaultCampus, defaultCohort };
+}
+
+/** One page of the list for the filters; the top three are ordinary rows, like every other student. */
+export function listPage(dataset: RankingDataset, filters: Filters, ownId?: number, seen?: ReadonlyMap<number, string | null>) {
+  const blackholedMode = filters.bh === 'blackholed', alumniMode = filters.bh === 'alumni', frozenMode = filters.bh === 'frozen', everyoneMode = filters.bh === 'all';
+  const genderIds = filters.gender ? dataset.genderRoster?.[filters.gender] ?? noGenderIds : undefined;
+  const { rows, matches, total: rankedTotal, page: rankedPage, pages: rankedPages } = selectLeaderboard(dataset.students, { ...filters, genderIds, alumni: alumniMode, frozen: frozenMode, seen }, ownId);
+  const inScope = (student: BlackholedStudent) => (!filters.campus || student.campusIds.includes(filters.campus)) && (!filters.cohort || student.commonCoreCohort === filters.cohort) && (!genderIds || genderIds.has(student.id)) && (!filters.q || matchesSearch(filters.q, [student.login, student.displayName]));
+  const lost = blackholedMode || everyoneMode ? dataset.blackholed.filter((student) => !student.anonymous && inScope(student)) : [];
+  if (filters.order === 'desc') lost.reverse();
+  const merged = blackholedMode ? lost : everyoneMode ? mergeByLevel(matches, lost, filters.order) : [];
+  const mergedPages = Math.max(1, Math.ceil(merged.length / 25)), mergedPage = Math.min(filters.page, mergedPages);
+  const mergedRows = merged.slice((mergedPage - 1) * 25, mergedPage * 25);
+  const page = blackholedMode || everyoneMode ? mergedPage : rankedPage, pages = blackholedMode || everyoneMode ? mergedPages : rankedPages;
+  const listed: (Ranked | BlackholedStudent)[] = everyoneMode ? mergedRows : rows;
+  return { blackholedMode, alumniMode, frozenMode, total: blackholedMode || everyoneMode ? merged.length : rankedTotal, page, pages, listed, seen, lostRows: blackholedMode ? lost.slice((mergedPage - 1) * 25, mergedPage * 25) : [] };
+}
+
+/** Last sessions of the frozen students in the filtered list, so it can run from the most recently seen; empty outside the Frozen view. */
+export async function frozenSeen(dataset: RankingDataset, filters: Filters): Promise<Map<number, string | null> | undefined> {
+  if (filters.bh !== 'frozen') return undefined;
+  const genderIds = filters.gender ? dataset.genderRoster?.[filters.gender] ?? noGenderIds : undefined;
+  const { matches } = selectLeaderboard(dataset.students, { ...filters, genderIds, frozen: true, page: 1 });
+  return loadLastSeen(matches.filter((student) => student.id > 0 && !student.anonymous).map((student) => student.id));
+}
+
+/** Signed 42 Intra photo links for the people shown. */
+export function avatarsFor(people: { id: number; photo?: string | null }[]) {
+  // Anonymous students have negative ids and no photo: nothing to look up.
+  const real = people.filter((person) => person.id > 0);
+  return photoReferences(real);
+}
+
+export function rowData(dataset: RankingDataset, view: ReturnType<typeof listPage>, avatars: Record<number, string>, userId: string): RankRowData[] {
+  const campus = (ids: number[]) => ids.map((id) => campusName(dataset, id)).join(' · ');
+  const lostRow = (student: BlackholedStudent): RankRowData => ({ kind: 'lost', id: student.id, login: student.login, level: student.level, year: student.commonCoreCohort, campus: campus(student.campusIds), src: avatars[student.id] ?? null, hacker: !!student.hacker, customBadge: student.customBadge, blackholedAt: student.blackholedAt });
+  if (view.blackholedMode) return view.lostRows.map(lostRow);
+  return view.listed.map((student) => !('rank' in student) ? lostRow(student) : student.anonymous ? {
+    // Nothing but the place in the list leaves the server for an anonymous student.
+    kind: 'ranked', id: student.id, login: 'Anonymous student', level: 0, year: null, campus: '', src: null, hacker: false, rank: student.rank, mine: false, alumni: false, frozen: false, anonymous: true,
+  } as RankRowData : ({
+    kind: 'ranked', id: student.id, login: student.login, level: student.level, year: student.commonCoreCohort, campus: campus(student.campusIds), src: avatars[student.id] ?? null,
+    hacker: !!student.hacker, customBadge: student.customBadge, rank: student.rank, mine: String(student.id) === userId, alumni: !!student.alumni, frozen: !!student.frozen, ...(student.frozen && view.seen?.get(student.id) ? { lastSeen: view.seen.get(student.id)! } : {}),
+  } as RankRowData));
+}

@@ -1,0 +1,134 @@
+import { describe, expect, it } from 'vitest';
+import { countValidated, pickMarked, projectDifficulty, returnRates, sliceOf, sliceRange, topValidated, type MarkedProject } from './validated';
+
+const now = Date.parse('2026-10-23T12:00:00Z');
+const hoursAgo = (hours: number) => new Date(now - hours * 3_600_000).toISOString();
+const row = (id: number, hours: number, validated: boolean | null = true, cursus = [21], teams: { id: number; status: string; 'validated?': boolean | null; closed_at: string }[] = []) => ({ id, 'validated?': validated, marked_at: hoursAgo(hours), cursus_ids: cursus, project: { id: 1, name: 'libft', slug: 'libft' }, teams });
+const team = (id: number, hours: number, validated: boolean | null, status = 'finished') => ({ id, status, 'validated?': validated, closed_at: hoursAgo(hours) });
+
+describe('pickMarked', () => {
+  it('keeps Common Core enrollments once, even when listed at two campuses', () => {
+    const records = pickMarked([
+      { campusId: 16, rows: [row(1, 2), row(2, 3, false), row(3, 4, true, [9]), row(4, 5), row(6, 6, null)] },
+      { campusId: 21, rows: [row(4, 5), row(5, 30)] },
+    ], 21);
+    expect(records.map((record) => [record.id, record.campusId, record.validated])).toEqual([['1', 16, true], ['2', 16, false], ['4', 16, true], ['5', 21, true]]);
+  });
+  it('counts every finished attempt, so a fail before a pass is not lost', () => {
+    const records = pickMarked([{ campusId: 16, rows: [row(7, 2, true, [21], [team(70, 50, false), team(71, 2, true), team(72, 1, null, 'in_progress')])] }], 21);
+    expect(records.map((record) => [record.id, record.validated, record.at])).toEqual([['7:70', false, hoursAgo(50)], ['7', true, hoursAgo(2)]]);
+  });
+  it('counts a team once, however many members have a row for the project', () => {
+    const member = (id: number, current: number, teams = [team(current, 5, false)]) => ({ ...row(id, 5, false, [21], teams), current_team_id: current });
+    const records = pickMarked([{ campusId: 16, rows: [member(31, 300), member(32, 300), member(33, 300), member(34, 301)] }], 21);
+    expect(records.map((record) => [record.id, record.team])).toEqual([['31', 300], ['34', 301]]);
+    const retried = (id: number) => member(id, 402, [team(400, 80, false), team(402, 5, true)]);
+    expect(pickMarked([{ campusId: 16, rows: [retried(41), retried(42)] }], 21).map((record) => record.id)).toEqual(['41:400', '41']);
+  });
+  it('dates the latest attempt by the record, since some steps are graded long after their team closed', () => {
+    const records = pickMarked([{ campusId: 21, rows: [row(8, 3, true, [21], [team(80, 24 * 400, false), team(81, 24 * 200, true)])] }], 21);
+    expect(records.map((record) => [record.id, record.validated, record.at])).toEqual([['8:80', false, hoursAgo(24 * 400)], ['8', true, hoursAgo(3)]]);
+  });
+});
+
+describe('countValidated', () => {
+  const records = [
+    { id: '1', campusId: 16, at: hoursAgo(2), project: 'libft', validated: true, internship: false },
+    { id: '2', campusId: 16, at: hoursAgo(30), project: 'push_swap', validated: true, internship: false },
+    { id: '3', campusId: 21, at: hoursAgo(24 * 10), project: 'libft', validated: true, internship: false },
+    { id: '4', campusId: 21, at: hoursAgo(24 * 40), project: 'libft', validated: true, internship: false },
+    { id: '5', campusId: 21, at: hoursAgo(5), project: 'push_swap', validated: true, internship: false },
+  ];
+  it('counts the last week and month', () => {
+    expect(countValidated(records, undefined, now)).toEqual({ week: 3, month: 4 });
+  });
+  it('narrows to one campus', () => {
+    expect(countValidated(records, 21, now)).toEqual({ week: 1, month: 2 });
+  });
+});
+
+describe('topValidated', () => {
+  const records = [
+    { id: '1', campusId: 16, at: hoursAgo(2), project: 'libft', validated: true, internship: false },
+    { id: '2', campusId: 16, at: hoursAgo(3), project: 'push_swap', validated: true, internship: false },
+    { id: '3', campusId: 21, at: hoursAgo(4), project: 'push_swap', validated: true, internship: false },
+    { id: '4', campusId: 21, at: hoursAgo(24 * 10), project: 'libft', validated: true, internship: false },
+    { id: '5', campusId: 21, at: hoursAgo(24 * 11), project: 'libft', validated: true, internship: false },
+  ];
+  it('ranks projects by validations in the window', () => {
+    expect(topValidated(records, 'week', undefined, 5, now)).toEqual([{ project: 'push_swap', count: 2 }, { project: 'libft', count: 1 }]);
+    expect(topValidated(records, 'month', undefined, 1, now)).toEqual([{ project: 'libft', count: 3 }]);
+  });
+  it('narrows to one campus', () => {
+    expect(topValidated(records, 'week', 16, 5, now)).toEqual([{ project: 'libft', count: 1 }, { project: 'push_swap', count: 1 }]);
+  });
+});
+
+describe('returnRates', () => {
+  const mark = (id: number, campusId: number, hours: number, validated: boolean, internship = false) => ({ id: String(id), campusId, at: hoursAgo(hours), project: 'libft', validated, internship });
+  const records = [
+    mark(1, 16, 2, true), mark(2, 16, 3, false), mark(3, 16, 30, false), mark(4, 16, 24 * 10, true),
+    mark(5, 21, 4, true), mark(6, 21, 24 * 20, false), mark(7, 21, 24 * 45, false),
+  ];
+  it('returns the share of graded projects that were not validated, per window', () => {
+    const all = returnRates(records, undefined, now);
+    expect(all.week).toEqual({ marked: 4, returned: 2, rate: .5 });
+    expect(all.month).toEqual({ marked: 6, returned: 3, rate: .5 });
+  });
+  it('narrows to one campus', () => {
+    expect(returnRates(records, 21, now).month).toEqual({ marked: 2, returned: 1, rate: .5 });
+  });
+  it('leaves internships out of the return rate', () => {
+    expect(returnRates([...records, mark(8, 16, 1, false, true), mark(9, 16, 1, false, true)], 16, now).week).toEqual({ marked: 3, returned: 2, rate: 2 / 3 });
+  });
+  it('has no rate when nothing was graded', () => {
+    expect(returnRates(records, 55, now).week).toEqual({ marked: 0, returned: 0, rate: null });
+  });
+  it('leaves validated counts untouched by returned projects', () => {
+    expect(countValidated(records, 16, now)).toEqual({ week: 1, month: 2 });
+  });
+});
+
+describe('validated slices', () => {
+  it('covers the 30-day window newest first, current slice included', () => {
+    const now = Date.parse('2026-10-25T12:00:00Z'), slices = sliceRange(now);
+    expect(slices[0]).toBe(sliceOf(now));
+    expect(slices.at(-1)).toBe(sliceOf(now - 30 * 86_400_000));
+    expect(slices).toEqual([...slices].sort((a, b) => b - a));
+    expect(slices.length).toBeGreaterThanOrEqual(7);
+  });
+  it('keeps the newest copy of an enrollment seen in two slices', () => {
+    const row = (marked: string, validated: boolean) => ({ id: 1, 'validated?': validated, marked_at: marked, cursus_ids: [21], project: { id: 1, name: 'libft', slug: 'libft' }, teams: [] });
+    const records = pickMarked([{ campusId: 16, rows: [row('2026-10-24T10:00:00Z', true)] }, { campusId: 16, rows: [row('2026-10-10T10:00:00Z', false)] }], 21);
+    expect(records).toEqual([expect.objectContaining({ at: '2026-10-24T10:00:00Z', validated: true })]);
+  });
+});
+
+describe('projectDifficulty', () => {
+  const at = new Date(now - 2 * 86_400_000).toISOString();
+  const make = (project: string, passed: number, failed: number, over: Partial<MarkedProject> = {}): MarkedProject[] =>
+    [...Array(passed).fill(true), ...Array(failed).fill(false)].map((ok, index) => ({ id: `${project}${index}${over.campusId ?? 16}`, campusId: 16, at, project, validated: ok, internship: false, ...over }));
+  const records = [...make('Hard', 4, 8), ...make('Easy', 11, 1), ...make('Rare', 0, 3), ...make('Internship', 0, 12, { internship: true })];
+
+  it('ranks the hardest projects first and drops small samples and internships', () => {
+    const list = projectDifficulty(records, 'week', undefined, 10, 8, now);
+    expect(list.map((item) => item.project)).toEqual(['Hard', 'Easy']);
+    expect(list[0]).toMatchObject({ attempts: 12, returned: 8 });
+    expect(list[0].rate).toBeCloseTo(2 / 3);
+  });
+  it('scopes to a campus and a window', () => {
+    expect(projectDifficulty([...records, ...make('Hard', 0, 12, { campusId: 21 })], 'week', 21, 10, 8, now)).toMatchObject([{ project: 'Hard', rate: 1 }]);
+    const old = make('Old', 0, 12, { at: new Date(now - 20 * 86_400_000).toISOString() });
+    expect(projectDifficulty(old, 'week', undefined, 10, 8, now)).toEqual([]);
+    expect(projectDifficulty(old, 'month', undefined, 10, 8, now)).toHaveLength(1);
+  });
+  it('splits each project across the campuses that evaluated it', () => {
+    const records = [...make('Hard', 2, 6), ...make('Hard', 5, 0, { campusId: 21 }), ...make('Hard', 0, 2, { campusId: 55 })];
+    const [hard] = projectDifficulty(records, 'week', undefined, 10, 8, now);
+    expect(hard.byCampus).toEqual({ 16: { attempts: 8, returned: 6 }, 21: { attempts: 5, returned: 0 }, 55: { attempts: 2, returned: 2 } });
+    expect(Object.values(hard.byCampus).reduce((sum, tally) => sum + tally.returned, 0)).toBe(hard.returned);
+  });
+  it('limits the list', () => {
+    expect(projectDifficulty(records, 'week', undefined, 10, 1, now)).toHaveLength(1);
+  });
+});
